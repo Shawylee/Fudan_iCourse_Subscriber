@@ -10,13 +10,25 @@ import os
 import re
 import time
 import uuid
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from src.runtime import config
 from src.api.webvpn import WebVPNSession, get_vpn_url
 
 
 _DATE_FROM_SUB_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
+
+
+class VideoLookupError(RuntimeError):
+    """Video availability could not be determined because an API call failed."""
+
+
+def _is_mp4_url(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    parsed = urlparse(value)
+    return (parsed.scheme in ("http", "https") and bool(parsed.netloc)
+            and parsed.path.lower().endswith(".mp4"))
 
 
 def _extract_date_from_sub(sub_title: str) -> str | None:
@@ -114,8 +126,12 @@ class ICourseClient:
         t_param = f"{user_id}-{now}-{md5_hash}"
 
         client_uuid = str(uuid.uuid4())
-        sep = "&" if "?" in video_url else "?"
-        return f"{video_url}{sep}clientUUID={client_uuid}&t={t_param}"
+        parsed = urlparse(video_url)
+        query = [(key, value) for key, value in
+                 parse_qsl(parsed.query, keep_blank_values=True)
+                 if key not in ("clientUUID", "t")]
+        query.extend((("clientUUID", client_uuid), ("t", t_param)))
+        return urlunparse(parsed._replace(query=urlencode(query), fragment=""))
 
     def get_course_detail(self, course_id: str) -> dict:
         """Get course details including title, teacher, and lecture list.
@@ -438,9 +454,9 @@ class ICourseClient:
 
         Returns the data payload from the API.
 
-        Non-zero API codes that still ship a populated data payload
-        (notably 7001 "视频未到开放时间", the school's 24h pre-release
-        review gate) are returned as partial data so the caller can
+        Code 7001 ("视频未到开放时间", the school's pre-release
+        review gate) with a populated payload is returned as partial data
+        so the caller can
         extract the video URL from nested content.playback.url — the
         gate scrubs top-level video_list/playurl but not the nested
         URL.  Only raises on HTTP failure or an entirely empty payload.
@@ -456,7 +472,10 @@ class ICourseClient:
         data = resp.json()
         payload = data.get("data") or {}
 
-        if data.get("code") != 0 and not payload:
+        code = data.get("code")
+        if str(code) != "0":
+            print(f"    [Video lookup {sub_id}] sub-info API code: {code}")
+        if str(code) != "0" and (not payload or str(code) != "7001"):
             raise RuntimeError(
                 f"API error for sub-info {sub_id}: {data.get('msg')}"
             )
@@ -480,9 +499,11 @@ class ICourseClient:
 
         Returns the signed video URL string, or None if no source yields one.
         """
+        lookup_errors = []
         try:
             info = self.get_sub_info(course_id, sub_id)
         except Exception as e:
+            lookup_errors.append(("sub-info", type(e).__name__))
             print(f"    sub-info unavailable for {sub_id} "
                   f"({type(e).__name__}); falling back to sub-detail")
             info = {}
@@ -497,31 +518,30 @@ class ICourseClient:
 
         # Try video_list first (has preview_url without /0/ prefix)
         video_list = info.get("video_list", {})
-        if isinstance(video_list, dict):
-            for _, v in video_list.items():
-                if isinstance(v, dict):
-                    preview = v.get("preview_url")
-                    if preview and preview.endswith(".mp4"):
-                        base_url = preview
-                        break
+        entries = (video_list.values() if isinstance(video_list, dict)
+                   else video_list if isinstance(video_list, list) else [])
+        for v in entries:
+            preview = v.get("preview_url") if isinstance(v, dict) else v
+            if _is_mp4_url(preview):
+                base_url = preview
+                break
 
         # Fallback: try playurl dict (has /0/ prefix, may need stripping)
         if not base_url:
             playurl = info.get("playurl", {})
-            if isinstance(playurl, dict):
-                for k, v in playurl.items():
-                    if k == "now":
-                        continue
-                    if isinstance(v, str) and v.endswith(".mp4"):
-                        base_url = v
-                        break
+            entries = (playurl.values() if isinstance(playurl, dict)
+                       else playurl if isinstance(playurl, list) else [])
+            for v in entries:
+                if _is_mp4_url(v):
+                    base_url = v
+                    break
 
         # Review-gate fallback: nested content.playback.url is preserved
         # even when code == 7001 scrubs the top-level fields above.
         if not base_url:
             playback = (info.get("content") or {}).get("playback") or {}
             nested = playback.get("url")
-            if isinstance(nested, str) and nested.endswith(".mp4"):
+            if _is_mp4_url(nested):
                 base_url = nested
                 if not now:
                     content_now = (info.get("content") or {}).get("now")
@@ -536,10 +556,23 @@ class ICourseClient:
                 playback = content.get("playback", {})
                 if playback and playback.get("url"):
                     base_url = playback["url"]
-            except Exception:
-                pass
+            except Exception as e:
+                lookup_errors.append(("sub-detail", type(e).__name__))
 
         if not base_url:
+            if lookup_errors:
+                failures = ", ".join(f"{endpoint}: {kind}"
+                                     for endpoint, kind in lookup_errors)
+                raise VideoLookupError(
+                    f"Video lookup failed for {sub_id} ({failures}); "
+                    "availability is unknown"
+                )
+            shapes = []
+            for key in ("video_list", "playurl", "content"):
+                value = info.get(key)
+                count = len(value) if isinstance(value, (dict, list)) else 0
+                shapes.append(f"{key}={type(value).__name__}({count})")
+            print(f"    [Video lookup {sub_id}] " + ", ".join(shapes))
             print(f"    No video URL found for {sub_id} (tried video_list, "
                   f"playurl, content.playback, sub_detail)")
             return None

@@ -20,6 +20,7 @@ import os
 import subprocess
 import threading
 import time
+import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -140,6 +141,11 @@ class _PendingSpawn:
     in the meantime and abort instead of resurrecting a zombie entry."""
 
 
+@dataclass
+class _SpawnFailure:
+    error: Exception
+
+
 class AudioDownloader:
     """Spawn-and-track concurrent ``ffmpeg`` audio extractions.
 
@@ -159,8 +165,8 @@ class AudioDownloader:
         self._dir = audio_dir
         self.max_concurrent = max_concurrent or config.VIDEO_DOWNLOAD_CONCURRENCY
         self._sem = threading.BoundedSemaphore(self.max_concurrent)
-        # sub_id -> AudioHandle (ready) | _PendingSpawn (spawn in flight)
-        self._active: dict[str, "AudioHandle | _PendingSpawn"] = {}
+        # Retain failed lookups so get() cannot mistake them for absent videos.
+        self._active: dict[str, "AudioHandle | _PendingSpawn | _SpawnFailure"] = {}
         self._lock = threading.Lock()
         self._reporter = reporter
         os.makedirs(self._dir, exist_ok=True)
@@ -205,22 +211,29 @@ class AudioDownloader:
         try:
             self._sem.acquire()
             try:
+                with self._lock:
+                    cancelled = self._active.get(sub_id) is not pending
+                if cancelled:
+                    self._sem.release()
+                    return
                 url = client.get_video_url(course_id, sub_id)
                 if not url:
                     self._pop_if_mine(sub_id, pending)
                     self._sem.release()
                     return
                 vpn_url, headers = client.get_stream_params(url)
-                path = os.path.join(self._dir, f"{sub_id}.raw")
-                if os.path.exists(path):
-                    os.remove(path)
+                # A timed-out lookup may finish after a retry has started.
+                # Separate files prevent that stale spawn deleting retry data.
+                path = os.path.join(self._dir, f"{sub_id}-{uuid.uuid4().hex}.raw")
 
                 cmd = [
                     "ffmpeg", "-y",
                     "-headers", headers,
                     "-reconnect", "1",
                     "-reconnect_streamed", "1",
+                    "-reconnect_on_network_error", "1",
                     "-reconnect_delay_max", "5",
+                    "-rw_timeout", str(config.AUDIO_READ_TIMEOUT * 1_000_000),
                     "-i", vpn_url,
                     "-vn",
                     "-ar", "16000",
@@ -291,8 +304,10 @@ class AudioDownloader:
                     target=self._monitor, args=(handle,),
                     name=f"audio-monitor-{sub_id}", daemon=True,
                 ).start()
-            except Exception:
-                self._pop_if_mine(sub_id, pending)
+            except Exception as e:
+                with self._lock:
+                    if self._active.get(sub_id) is pending:
+                        self._active[sub_id] = _SpawnFailure(e)
                 self._sem.release()
                 raise
         except Exception as e:
@@ -318,6 +333,11 @@ class AudioDownloader:
                     return None
                 if isinstance(entry, AudioHandle):
                     return entry
+                if isinstance(entry, _SpawnFailure):
+                    raise RuntimeError(
+                        f"Audio lookup/start failed for {sub_id}: "
+                        f"{type(entry.error).__name__}"
+                    ) from entry.error
             if time.time() > deadline:
                 raise TimeoutError(
                     f"audio download for {sub_id} did not start within "
