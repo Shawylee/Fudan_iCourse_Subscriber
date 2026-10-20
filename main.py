@@ -68,7 +68,9 @@ def _check_session(client: ICourseClient) -> None:
 
 
 def _enumerate_lectures(client: ICourseClient, db: Database,
-                        reporter: Reporter) -> list[tuple[str, str, dict]]:
+                        reporter: Reporter,
+                        failed_courses: list[str] | None = None
+                        ) -> list[tuple[str, str, dict]]:
     """Sync, fast: list every (course_id, course_title, lecture) we'll
     process this run.  Done up-front so the prefetch loop can see across
     course boundaries when picking the "next" lecture."""
@@ -139,6 +141,8 @@ def _enumerate_lectures(client: ICourseClient, db: Database,
                 )
                 out.append((course_id, course_title, lecture))
         except Exception:
+            if failed_courses is not None:
+                failed_courses.append(course_id)
             reporter.course_enumeration_error(course_id)
             traceback.print_exc()
     return out
@@ -148,7 +152,7 @@ def _drive_lectures(client: ICourseClient, db: Database,
                     scheduler: Scheduler, transcriber: Transcriber,
                     summarizer: Summarizer, reporter: Reporter,
                     all_lectures: list[tuple[str, str, dict]],
-                    email_items: list) -> None:
+                    email_items: list) -> list[str]:
     """Phase 2: run each lecture through LectureRunner.
 
     Pre-schedules the first lecture's prefetch (audio + images) before
@@ -156,11 +160,13 @@ def _drive_lectures(client: ICourseClient, db: Database,
     each LectureRunner.run via ``next_info``.
     """
     if not all_lectures:
-        return
+        return []
 
     runner = LectureRunner(
         client, db, scheduler, transcriber, summarizer, reporter,
+        refresh_session=lambda: _check_session(client),
     )
+    failed = []
 
     first_course, _, first_lec = all_lectures[0]
     runner.prefetch_first(first_course, str(first_lec["sub_id"]))
@@ -172,8 +178,8 @@ def _drive_lectures(client: ICourseClient, db: Database,
             next_course, _, next_lec = all_lectures[i + 1]
             next_info = (next_course, str(next_lec["sub_id"]))
 
-        _check_session(client)
         try:
+            _check_session(client)
             summary = runner.run(
                 course_id, course_title, lecture, next_info=next_info,
             )
@@ -186,6 +192,7 @@ def _drive_lectures(client: ICourseClient, db: Database,
                     "summary": summary,
                 })
         except Exception:
+            failed.append(sub_id)
             reporter.lecture_error(sub_id)
             traceback.print_exc()
         finally:
@@ -194,6 +201,19 @@ def _drive_lectures(client: ICourseClient, db: Database,
             # PPTPipeline.submit released the cache.
             scheduler.image_cache.discard(sub_id)
             scheduler.audio_downloader.release(sub_id)
+
+        row = db.get_lecture(sub_id)
+        if sub_id not in failed and not (row and row.get("processed_at")):
+            failed.append(sub_id)
+        if sub_id in failed:
+            stage = (row or {}).get("error_stage") or "processing"
+            reporter.info(f"    [Result] Incomplete lecture {sub_id}: {stage}")
+
+    reporter.info(
+        f"[Result] Queued: {len(all_lectures)}, "
+        f"processed: {len(all_lectures) - len(failed)}, incomplete: {len(failed)}"
+    )
+    return failed
 
 
 def _send_email(emailer: Emailer | None, db: Database, reporter: Reporter,
@@ -324,10 +344,11 @@ def run():
         return
 
     scheduler = Scheduler(reporter=reporter)
+    failed_courses: list[str] = []
 
     try:
-        all_lectures = _enumerate_lectures(client, db, reporter)
-        _drive_lectures(
+        all_lectures = _enumerate_lectures(client, db, reporter, failed_courses)
+        failed_lectures = _drive_lectures(
             client, db, scheduler, transcriber, summarizer, reporter,
             all_lectures, email_items,
         )
@@ -337,6 +358,12 @@ def run():
 
     _send_email(emailer, db, reporter, email_items)
     reporter.run_footer()
+    if failed_courses or failed_lectures:
+        raise RuntimeError(
+            f"Run incomplete: {len(failed_courses)} course lookup failure(s), "
+            f"{len(failed_lectures)} unfinished lecture(s). "
+            "Completed results were retained; see [Result] lines above."
+        )
 
 
 if __name__ == "__main__":

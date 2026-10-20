@@ -163,6 +163,9 @@ OCR_MAX_TARGET = int(os.environ.get("OCR_MAX_TARGET", "2"))
 VIDEO_DOWNLOAD_CONCURRENCY = int(
     os.environ.get("VIDEO_DOWNLOAD_CONCURRENCY", "2")
 )
+AUDIO_DOWNLOAD_ATTEMPTS = max(1, int(os.environ.get("AUDIO_DOWNLOAD_ATTEMPTS", "3")))
+AUDIO_RETRY_DELAY = max(0, float(os.environ.get("AUDIO_RETRY_DELAY", "5")))
+AUDIO_READ_TIMEOUT = max(1, int(os.environ.get("AUDIO_READ_TIMEOUT", "30")))
 
 # 是否优先使用 iCourse 官方字幕（跳过 ASR 转录）。默认关闭。
 USE_OFFICIAL_TRANSCRIPT = (

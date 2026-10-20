@@ -38,6 +38,14 @@ BYTES_PER_SECOND = SAMPLE_RATE * BYTES_PER_SAMPLE
 SILENCE_GAP_THRESHOLD_SEC = 30 * 60  # 30 min of no speech → suspected cutoff
 
 
+def _ffmpeg_diagnostic(stderr: bytes) -> str:
+    text = stderr.decode(errors="replace")
+    text = re.sub(r"https?://[^\s]+", "[media URL]", text)
+    text = re.sub(r"(?im)(Cookie|Authorization):[^\r\n]*",
+                  r"\1: [redacted]", text)
+    return text[-2000:]
+
+
 # ── Shared resource meter state (network delta tracking) ──────────────────
 _rm_net_last: tuple[float, int, int] | None = None
 
@@ -488,7 +496,7 @@ class Transcriber:
         # -9/-15: SIGKILL/SIGTERM — the downloader's release() terminates
         # ffmpeg once we're done reading; neither is an ffmpeg failure.
         if rc not in (0, -9, -15, None):
-            stderr_text = stderr_output.decode(errors="replace")
+            stderr_text = _ffmpeg_diagnostic(stderr_output)
             if "does not contain any stream" in stderr_text:
                 raise NoAudioStreamError(
                     f"ffmpeg found no audio stream (video-only file).\n"
@@ -500,7 +508,7 @@ class Transcriber:
             )
 
         if total_bytes == 0:
-            stderr_text = stderr_output.decode(errors="replace")[-500:]
+            stderr_text = _ffmpeg_diagnostic(stderr_output)
             raise RuntimeError(
                 f"ffmpeg produced no audio output (0 bytes received).\n"
                 f"stderr (last 500 chars):\n{stderr_text}"
@@ -545,7 +553,7 @@ class Transcriber:
         return transcript, segments
 
     def _check_completeness(self, transcript: str,
-                            segments: list[dict]) -> None:
+                            segments: list[dict], diagnostic: str = "") -> None:
         """Raise IncompleteAudioError when we received <90 % of the media.
 
         ``_media_duration`` is parsed from ffmpeg's stderr by
@@ -563,6 +571,7 @@ class Transcriber:
                     expected_duration=self._media_duration,
                     transcript=transcript,
                     segments=segments,
+                    diagnostic=diagnostic,
                 )
 
     # ── Public mode 1 — disk tail-f (preferred) ─────────────────────────
@@ -595,7 +604,11 @@ class Transcriber:
         t_wait = time.time()
         while not os.path.exists(audio_path):
             if ffmpeg_proc.poll() is not None:
-                stderr_text = b"".join(stderr_chunks).decode(errors="replace")[-500:]
+                stderr_text = _ffmpeg_diagnostic(b"".join(stderr_chunks))
+                if "does not contain any stream" in stderr_text:
+                    raise NoAudioStreamError(
+                        f"ffmpeg found no audio stream.\nstderr:\n{stderr_text}"
+                    )
                 raise RuntimeError(
                     f"ffmpeg exited (rc={ffmpeg_proc.returncode}) before "
                     f"writing audio file {audio_path}.\nstderr:\n{stderr_text}"
@@ -629,7 +642,11 @@ class Transcriber:
             # ffmpeg can exit 0 on a server-side truncated stream; without
             # this check the partial transcript would silently pass as a
             # complete lecture.
-            self._check_completeness(transcript, segments)
+            self._check_completeness(
+                transcript, segments,
+                diagnostic=f"ffmpeg exit code: {ffmpeg_proc.returncode}\n"
+                f"stderr:\n{_ffmpeg_diagnostic(b''.join(stderr_chunks))}",
+            )
             return transcript, segments
         finally:
             f.close()
@@ -706,7 +723,11 @@ class Transcriber:
             stderr_thread.join(timeout=5)
 
         # Both URL/pipe modes enforce the 90 % completeness check
-        self._check_completeness(transcript, segments)
+        self._check_completeness(
+            transcript, segments,
+            diagnostic=f"ffmpeg exit code: {proc.returncode}\n"
+            f"stderr:\n{_ffmpeg_diagnostic(b''.join(stderr_chunks))}",
+        )
 
         return transcript, segments
 
@@ -742,7 +763,10 @@ class IncompleteAudioError(RuntimeError):
     def __init__(self, message: str, actual_duration: float,
                  expected_duration: float,
                  transcript: str = "",
-                 segments: Optional[list[dict]] = None):
+                 segments: Optional[list[dict]] = None,
+                 diagnostic: str = ""):
+        if diagnostic:
+            message += f"\n{diagnostic}"
         super().__init__(message)
         self.actual_duration = actual_duration
         self.expected_duration = expected_duration
