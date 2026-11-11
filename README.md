@@ -35,6 +35,7 @@
 |---|---|---|---|
 | `STUID` | ✅ | 复旦学号 | `22307110000` |
 | `UISPSW` | ✅ | UIS 统一身份认证密码 | `your_password` |
+| `UIS_TOTP_SECRET` | 二次验证时必填 | UIS 动态口令的 Base32 绑定密钥，不是邮箱验证码 | |
 | `COURSE_IDS` | ✅ | 要监控的课程 ID，多个用英文逗号分隔 | `35472,30251` |
 | `DASHSCOPE_API_KEY` | ⬜ | ModelScope 平台 API Key | `ms-xxxxxxxx` |
 | `DEEPSEEK_API_KEY` | ⬜ | DeepSeek API Key（推荐） | `sk-xxxxxxxx` |
@@ -44,6 +45,8 @@
 | `RECEIVER_EMAIL` | ✅ | 接收摘要邮件的邮箱 | `you@m.fudan.edu.com` |
 
 > 至少配置一个 LLM API Key（DASHSCOPE、DEEPSEEK 或 GEMINI）。程序按配置顺序自动回退尝试。如果需要选择其他的LLM供应商，可以在`src\runtime\config.py`路径下自定义供应商。
+
+如登录 iCourse 时需要二次验证，请在 [UIS 账号安全](https://id.fudan.edu.cn/uc/#/pc/userCenter/accountSecurity)中绑定「动态口令」，将绑定时显示的 Base32 密钥存入仓库的 `UIS_TOTP_SECRET`。不要提交或分享密钥、绑定二维码或验证码。
 
 ### 第 3 步：获取课程 ID
 
