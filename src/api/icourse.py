@@ -548,7 +548,8 @@ class ICourseClient:
                     if isinstance(content_now, (int, str)):
                         now = int(content_now)
 
-        # Last resort: hit get-sub-detail (gate-free) directly.
+        # Check direct metadata before deriving the upstream cover fallback.
+        detail = {}
         if not base_url:
             try:
                 detail = self.get_sub_detail(course_id, sub_id)
@@ -558,6 +559,17 @@ class ICourseClient:
                     base_url = playback["url"]
             except Exception as e:
                 lookup_errors.append(("sub-detail", type(e).__name__))
+
+        if not base_url:
+            for source in (info, detail):
+                poster = (source.get("content") or {}).get("webp_path")
+                if (isinstance(poster, str) and "/Pic/" in poster
+                        and poster.endswith("_500k.webp")):
+                    base_url = poster.replace("/Pic/", "/", 1).removesuffix(
+                        "_500k.webp"
+                    ) + "_1920_1080.mp4"
+                    print(f"    Video source resolved from alternate metadata for {sub_id}")
+                    break
 
         if not base_url:
             if lookup_errors:
@@ -574,7 +586,7 @@ class ICourseClient:
                 shapes.append(f"{key}={type(value).__name__}({count})")
             print(f"    [Video lookup {sub_id}] " + ", ".join(shapes))
             print(f"    No video URL found for {sub_id} (tried video_list, "
-                  f"playurl, content.playback, sub_detail)")
+                  f"playurl, content.playback, sub_detail, video cover)")
             return None
 
         return self.sign_video_url(base_url, now=now)

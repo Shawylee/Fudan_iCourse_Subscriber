@@ -256,9 +256,8 @@ class LectureRunner:
                         sub_id: str) -> tuple[Optional[str], Optional[list]]:
         """Return (transcript, segments) or (None, None) on skip.
 
-        Tries the official iCourse transcript first — when available and
-        complete-enough (no >20 min silence gaps) it replaces the ASR
-        step entirely, saving ~5 min of CPU time per lecture.
+        Prefer video ASR unless configured otherwise. If video lookup
+        yields no source, try completeness-checked official subtitles.
         """
         if existing and existing.get("transcript"):
             self._reporter.info(
@@ -268,36 +267,35 @@ class LectureRunner:
             )
             return existing["transcript"], None
 
-        # Try official transcript before firing up ASR (config-gated).
         if config.USE_OFFICIAL_TRANSCRIPT:
-            try:
-                official = self._official_cache.pop(sub_id, None)
-                if official is None:
-                    official = self._client.get_transcript_segments(sub_id)
-                # Phase B registered the PPT rows, so the last screenshot
-                # offset is available as a duration lower bound for the
-                # tail-truncation check.
-                duration_hint = self._db.get_max_ppt_created_sec(sub_id)
-                if self._official_transcript_usable(
-                        official, duration_hint_s=duration_hint):
-                    text = " ".join(s["text"] for s in official)
-                    self._reporter.info(
-                        f"    Using official transcript "
-                        f"({len(text)} chars, {len(official)} segments)"
-                    )
-                    self._db.update_transcript(sub_id, text)
-                    # The audio may have been prefetched before we knew the
-                    # official transcript was usable — stop that download
-                    # now instead of letting it run until Phase H.
-                    self._release_audio(sub_id)
-                    return text, official
-            except Exception as e:
-                self._reporter.info(
-                    f"    [Official transcript] unavailable, falling back "
-                    f"to ASR: {type(e).__name__}: {e}"
-                )
+            official = self._try_official_transcript(sub_id)
+            if official is not None:
+                return official
 
         return self._download_transcript(course_id, sub_id)
+
+    def _try_official_transcript(self, sub_id: str):
+        try:
+            official = self._official_cache.pop(sub_id, None)
+            if official is None:
+                official = self._client.get_transcript_segments(sub_id)
+            duration_hint = self._db.get_max_ppt_created_sec(sub_id)
+            if not self._official_transcript_usable(
+                    official, duration_hint_s=duration_hint):
+                self._reporter.info("    [Official transcript] unavailable or incomplete")
+                return None
+            text = " ".join(s["text"] for s in official)
+            self._db.update_transcript(sub_id, text)
+            self._release_audio(sub_id)
+            self._reporter.info(
+                f"    Using official transcript ({len(text)} chars, {len(official)} segments)"
+            )
+            return text, official
+        except Exception as e:
+            self._reporter.info(
+                f"    [Official transcript] unavailable: {type(e).__name__}: {e}"
+            )
+            return None
 
     def _download_transcript(self, course_id: str,
                              sub_id: str) -> tuple[Optional[str], Optional[list]]:
@@ -328,6 +326,10 @@ class LectureRunner:
                     f"{type(e).__name__}: {e}"
                 )
                 if attempt == attempts:
+                    if stage == "no_video" and not config.USE_OFFICIAL_TRANSCRIPT:
+                        official = self._try_official_transcript(sub_id)
+                        if official is not None:
+                            return official
                     self._db.update_error(sub_id, stage, str(e))
                     return None, None
             else:
